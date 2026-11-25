@@ -31,6 +31,8 @@ For video support (multimodal decision models), `ffmpeg` and `ffprobe` must also
    - [ModelScope 4B](https://modelscope.cn/models/StartLuxAI/StartLux-Decision-v1.1-4B-AutoThink) / [9B](https://modelscope.cn/models/StartLuxAI/StartLux-Decision-v1.1-9B-AutoThink) / [27B](https://modelscope.cn/models/StartLuxAI/StartLux-Decision-v1.1-27B-AutoThink)
 8. H2O-4B: Qwen3.5-4B hybrid with the released LoRA already merged + a fixed 255-row label readout, one question per sequence
    - [ModelScope](https://modelscope.cn/models/h2oai/h2o-lightning-4b) / [HuggingFace](https://huggingface.co/h2oai/h2o-lightning-4b)
+9. D3-Flash uses a Qwen3.5 hybrid backbone. Its full-attention layers use bidirectional attention, and its Gated DeltaNet layers use a causal scan. The model scores each option from the hidden state of the final prompt token.
+   - [ModelScope](https://www.modelscope.cn/models/vllm-sr/d3-flash) / [HuggingFace](https://huggingface.co/vllm-sr/d3-flash)
 
 | Model | `--model_type` | Base | Head Artifacts | `--loss_type` |
 |-------|----------------|------|----------------|----------------|
@@ -43,6 +45,7 @@ For video support (multimodal decision models), `ffmpeg` and `ffprobe` must also
 | Laya | `laya` | ModernBERT-large (bidirectional, no adapter) | `model.safetensors` (encoder + head in one file) + `rl_agent_config.json` (architecture + per-kind/per-bucket temperatures) | `ce_rps` |
 | StartLux | `startlux` | Merged Qwen3.5 hybrid (vision tower, causal) | `decision_config.json` (26 letter token ids + per-kind read-out temperatures) | `distill_rps` |
 | H2O-4B | `h2o` | Qwen3.5-4B hybrid with the released LoRA already merged | `label_rows.safetensors` (fixed 255×hidden readout) + `serve_config.json` (255 labels + per-kind temperatures) | `scoring` |
+| D3-Flash | `d3` | Qwen3.5 hybrid | `readout.safetensors` (trainable 255-row FP32 readout) + `decision_config.json` | `scoring` |
 
 Developers can convert any CausalLM into a decision model by specifying:
 
@@ -218,7 +221,7 @@ swift sft --task_type decision ... --split_dataset_ratio 0.1
 
 ## Dataset Format
 
-Each model has its own raw JSONL schema, normalized by that model's dedicated `ScoringPreprocessor` subclass into the unified internal contract. The schemas fall into three structural families; which `--model_type` uses which family is listed in the [Supported Models](#supported-models) table.
+Each model has its own JSONL schema. Its preprocessor converts raw records into the shared decision format.
 
 ### One-Question-Per-Row Schema
 
@@ -367,9 +370,19 @@ fixed 255-row label matrix.
   `A) name: description`, where the letter is presentation only and the 255 readout rows follow the
   `criteria` order; each record renders exactly one question.
 
+### D3-Flash
+
+D3-Flash uses the standard JSONL loader. Each row contains a `state` and a list of `questions`. `D3Preprocessor` expands this list into one example per question.
+
+```json lines
+{"state":"The order is paid and awaiting shipment.","questions":[{"kind":"choice","question":"Select the order status.","options":["paid: Paid","shipped: Shipped"],"gold":[1,0]},{"kind":"noul","question":"Has the order shipped?","gold":[1,0]}]}
+```
+
+For `choice`, list 1–255 option texts in display order. For `noul`, the default order is false, then true. For `score`, list 2–10 distinct ordered levels. Use a zero-based index or a distribution in option order for `gold`. Keep field types consistent within each file. When mixing hard and soft labels, use one-hot arrays for hard labels. Serialize structured states as JSON strings when mixing them with plain text. Split the source records into training and validation sets before expanding them into individual questions.
+
 ## Training
 
-ms-swift ships a training script per integrated model at `examples/train/decision/<model_type>.sh` (using **local mini datasets** — no download needed), loading local data via `--external_plugins examples/train/decision/dataset.py --dataset <model_type>_decision`; **remote datasets** (`--dataset open_jev_<model_type>:all`, requiring online download of the Open-Jev corpus) are also supported. The two methods differ only in data source; all other parameters are identical. See the [Datasets](#datasets) section for details. Each model's complete runnable command (including `--adapters` path resolution and head-artifact env exports) is in its script.
+Training scripts are in `examples/train/decision/`. The local examples register datasets through `--external_plugins`. D3-Flash uses `d3.sh`. Models with a registered Open-Jev dataset can also load the remote corpus by name. See [Datasets](#datasets).
 
 ### Command Skeleton
 
@@ -530,6 +543,36 @@ Key parameters:
 - The output dir contains the adapter, `scoring_head.safetensors` (255-row readout) and `scoring_head.json`
   (`head_temperature` + per-kind `temperatures`)
 
+### D3-Flash
+
+D3-Flash loads the Qwen3.5 backbone and `readout.safetensors` from the release directory. The example uses the Qwen3.5 multimodal architecture mapping to select LoRA target layers in the language backbone and also trains the 255-row FP32 readout. With `transformers>=5.13.1`, run the following command from the repository root using your local model directory for `--model`.
+
+```bash
+swift sft \
+    --model /path/to/d3-flash \
+    --model_type d3 --task_type decision \
+    --external_plugins examples/train/decision/dataset.py \
+    --dataset d3_decision --val_dataset d3_decision_val --split_dataset_ratio 0 \
+    --tuner_type lora --tuner_backend peft \
+    --lora_rank 8 --lora_alpha 16 --lora_dropout 0 \
+    --loss_type scoring --padding_side left --attn_impl sdpa \
+    --torch_dtype bfloat16 --max_length 2048 \
+    --gradient_checkpointing true \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
+    --per_device_train_batch_size 1 --per_device_eval_batch_size 1 \
+    --learning_rate 1e-4 --gradient_accumulation_steps 1 --max_steps 4 \
+    --eval_strategy steps --eval_steps 2 --save_steps 2 --logging_steps 1 \
+    --output_dir output/d3
+```
+
+**Key parameters**
+
+- The plugin registers both splits with `D3Preprocessor`. Set `D3_TRAIN_FILE` and `D3_VAL_FILE` to use your own JSONL files.
+- `--loss_type scoring` computes cross-entropy over each question’s valid options using the target distribution in `target_probs`.
+- `--padding_side left` aligns each question’s final prompt token at the end of the sequence for the readout. With `--attn_impl sdpa`, full-attention layers use bidirectional attention and Gated DeltaNet layers retain their causal scan.
+
+The example runs four optimizer steps, evaluating and saving every two steps. You can also set `D3_MODEL_DIR` and `D3_OUTPUT_DIR` and run the [training script](../../../examples/train/decision/d3.sh).
+
 ### StartLux
 
 StartLux-Decision v1.1 AutoThink ships a merged backbone, so a fresh LoRA is trained on top and the letter
@@ -652,17 +695,17 @@ The data format uses the one-question-per-row schema (see [Dataset Format](#data
 
 ## Datasets
 
-Decision model datasets come in two forms: **local datasets** (registered via `--external_plugins` with the appropriate `ScoringPreprocessor` subclass) and **remote datasets** (SWIFT's built-in Open-Jev corpus, loaded directly with `--dataset <name>`).
+Decision models support local datasets registered through `--external_plugins` with a model-specific `ScoringPreprocessor` subclass. The built-in remote Open-Jev datasets can be loaded directly with `--dataset <name>`.
 
-> **Important**: Decision data **cannot** be loaded via `--dataset /path/to/file.jsonl` directly. Swift's standard data-loading method (passing a file path, which uses `AutoPreprocessor`) does not work for decision data — `AutoPreprocessor` does not recognize the `{state, questions: [{kind, question, options, gold}]}` schema and will either silently take the wrong path or error out. You **must** register a Python plugin via `--external_plugins` that uses the appropriate `ScoringPreprocessor` subclass.
+> To load raw decision records such as `state/questions/answers`, register the corresponding `ScoringPreprocessor` subclass through `--external_plugins` and select the dataset by its registered name. The D3-Flash example uses `d3_decision` for training and `d3_decision_val` for validation.
 
 ### Remote Datasets (Open-Jev)
 
 SWIFT registers the [Open-Jev](https://www.modelscope.cn/datasets/ZefanCai/Open-Jev) and [Open-Jev-v1.1](https://modelscope.cn/datasets/ZefanCai/Open-Jev-v1.1) corpora as built-in remote datasets. No `--external_plugins` is needed — use `--dataset <name>` directly.
 
-Dataset names follow the **`open_jev_<model_type>`** rule — every integrated model (see the [Supported Models](#supported-models) table) has its remote dataset registered under this convention, preprocessed by that model's dedicated `ScoringPreprocessor` subclass. To use the v1.1 corpus, switch to the `_v11`-suffixed name (e.g. `--dataset open_jev_<model_type>_v11`).
+Registered Open-Jev datasets follow the `open_jev_<model_type>` naming convention and use the corresponding `ScoringPreprocessor` subclass. For the v1.1 corpus, use the registered name with the `_v11` suffix.
 
-The `--dataset` in the training commands shown in this document uses remote dataset names (e.g. `open_jev_jev`), which require downloading the `ZefanCai/Open-Jev` corpus online.
+Training commands that specify a remote dataset name (e.g. `open_jev_jev`) download the `ZefanCai/Open-Jev` corpus online.
 
 #### Open-Jev Raw Row Examples
 
@@ -703,7 +746,7 @@ score (`options` forced to canonical `["0", "1", "2", "3", "4", "5"]`):
 
 ### Local Datasets
 
-Local datasets require a Python plugin file passed via `--external_plugins`. The plugin uses `register_dataset` with the appropriate `ScoringPreprocessor` subclass.
+For local data in a model-specific raw format, register the corresponding `ScoringPreprocessor` subclass with `register_dataset` in a Python plugin and load it with `--external_plugins`.
 
 #### Ready-Made Examples
 
@@ -716,7 +759,7 @@ Run a training script directly:
 sh examples/train/decision/<model_type>.sh
 ```
 
-The scripts load local data via `--external_plugins examples/train/decision/dataset.py --dataset <model_type>_decision` — no remote download needed. The training commands in this document use remote datasets (e.g. `--dataset open_jev_jev`); the only difference is the data source — all other parameters are identical.
+D3-Flash registers its training and validation datasets through `examples/train/decision/dataset.py`. From the repository root, run `bash examples/train/decision/d3.sh`.
 
 #### Writing a Custom Plugin
 
@@ -928,6 +971,7 @@ When unset, the loader searches `model_dir` (and the `adapter_vllm/` subdirector
 - **`h2o` fixed readout**: `label_rows` is stored as a buffer and is not trained; `serve_config.json` (255 labels + per-kind temperatures) must ship with the checkpoint.
 - **`h2o` bidirectional attention**: follows `two_way.default` in `serve_config.json` (bidirectional) by default and can fall back with `H2O_TWO_WAY=0`; two-way requires `transformers>=5.13.0`, and on Ascend NPU the full-attention mask is materialised as `[B,1,S,S]`.
 - **`h2o` image input is not supported yet**: the template already passes images through, but the preprocessor does not lift them from the record, so only textual `state` works for now; planned as a follow-up.
+- D3-Flash processes one text question per sequence. Keep packing and padding-free mode disabled. Prompts over the length limit raise `MaxLengthError`.
 - **`tie_word_embeddings=True` adapter merge**: Only affects "merge adapter / convert format"; training and inference are unaffected.
 
 ## Verification Report

@@ -31,6 +31,8 @@ pip install "ms-swift>=4.6.0"
   - [ModelScope 4B](https://modelscope.cn/models/StartLuxAI/StartLux-Decision-v1.1-4B-AutoThink) / [9B](https://modelscope.cn/models/StartLuxAI/StartLux-Decision-v1.1-9B-AutoThink) / [27B](https://modelscope.cn/models/StartLuxAI/StartLux-Decision-v1.1-27B-AutoThink)
 8. H2O-4B：已合并发布版 LoRA 的 Qwen3.5-4B hybrid + 固定 255 行 label readout，单题单序列
   - [ModelScope](https://modelscope.cn/models/h2oai/h2o-lightning-4b) / [HuggingFace](https://huggingface.co/h2oai/h2o-lightning-4b)
+9. D3-Flash: 使用 Qwen3.5 混合注意力骨干。全注意力层采用双向注意力，Gated DeltaNet 层保持因果扫描。模型从最后一个提示词 token 的隐藏状态为各选项打分。
+  - [modelscope](https://www.modelscope.cn/models/vllm-sr/d3-flash) / [HuggingFace](https://huggingface.co/vllm-sr/d3-flash)
 
 
 | 模型         | `--model_type` | 底座                               | 头制品                                                                            | `--loss_type`  |
@@ -44,6 +46,7 @@ pip install "ms-swift>=4.6.0"
 | Laya       | `laya`         | ModernBERT-large（双向，无 adapter）   | `model.safetensors`（编码器 + 头同文件）+ `rl_agent_config.json`（结构 + per-kind/per-bucket 温度） | `ce_rps`       |
 | StartLux   | `startlux`     | 已合并的 Qwen3.5 hybrid（视觉塔，因果） | `decision_config.json`（26 个字母 token id + per-kind read-out 温度）                 | `distill_rps`  |
 | H2O-4B     | `h2o`          | 已合并 LoRA 的 Qwen3.5-4B hybrid | `label_rows.safetensors`（255×hidden 固定 readout）+ `serve_config.json`（255 个标签 + per-kind 温度） | `scoring`      |
+| D3-Flash | `d3` | Qwen3.5 hybrid | `readout.safetensors`（可训练的 255 行 FP32 读出头）+ `decision_config.json` | `scoring` |
 
 
 开发者可以将任意 CausalLM 转为决策模型，只需指定：
@@ -382,9 +385,20 @@ H2O 使用自己的请求格式：`questions` 是**列表**，一次前向只读
 - gold 可写在题目内（`gold`/`answer`/`label`/`target`），或在记录级用 `answers`/`golds`/`targets`（列表题目按**下标**、字典题目按 key 索引）。取值可以是选项名、下标，或按选项顺序的完整分布。
 - 与 THX-02 的差异：`questions` 是列表而非字典；选项渲染为 `A) 选项名: 描述`，字母只是展示，readout 的 255 行按 `criteria` 顺序与选项一一对应；每条记录只渲染一个问题。
 
+### D3-flash
+
+D3-Flash 使用通用 JSONL 加载器。每行包含一个 `state` 和一个 `questions` 列表，`D3Preprocessor` 将列表展开为每题一条样本。
+
+```json lines
+{"state":"订单已付款，尚未发货。","questions":[{"kind":"choice","question":"选择订单状态","options":["paid: 已付款","shipped: 已发货"],"gold":[1,0]},{"kind":"noul","question":"订单是否已发货？","gold":[1,0]}]}
+```
+
+`choice` 按展示顺序列出 1–255 个选项文本，`noul` 默认按 `false, true` 排列，`score` 列出 2–10 个互异的有序等级。`gold` 可以是从 0 开始的下标，也可以是按选项顺序排列的分布。同一文件内的字段类型应一致。混用硬标签与软标签时，将硬标签写成 one-hot 数组；混用文本和结构化状态时，将结构化状态写成 JSON 字符串。训练集和验证集先按原始记录划分。
+
+
 ## 训练
 
-ms-swift 为每个已接入模型提供训练脚本 `examples/train/decision/<model_type>.sh`（使用**本地 mini 数据集**，无需联网下载），通过 `--external_plugins examples/train/decision/dataset.py --dataset <model_type>_decision` 加载本地数据；同时支持使用**远程数据集**（`--dataset open_jev_<model_type>:all`，需在线下载 Open-Jev 语料）。两种方式仅数据来源不同，其余参数完全一致，详见[数据集](#数据集)章节。各模型的完整可运行命令（含 `--adapters` 路径获取、头制品环境变量导出等）见对应脚本。
+各模型的训练脚本位于 `examples/train/decision/`。本地示例通过 `--external_plugins` 注册数据集，D3-Flash 使用 `d3.sh`。已注册 Open-Jev 语料的模型也可以用远程数据集名称启动，详见[数据集](#数据集)。
 
 ### 命令骨架
 
@@ -526,6 +540,36 @@ swift sft \
 - 双向需要 `transformers>=5.13.0`，低版本只能用 `H2O_TWO_WAY=0` 走单向；两种模式的 per-kind 温度分别取自 `two_way.temperature` 与顶层 `temperature`，不要混用
 - 训练输出目录包含 adapter、`scoring_head.safetensors`（255 行 readout）与 `scoring_head.json`（`head_temperature` + per-kind `temperatures`）
 
+### D3-Flash
+
+D3-Flash 从发布目录加载 Qwen3.5 骨干和 `readout.safetensors`。示例按 Qwen3.5 的多模态架构映射选择语言骨干中的 LoRA 目标层，并同时更新 255 行 FP32 读出头。使用 `transformers>=5.13.1`，在仓库根目录运行以下命令，将 `--model` 替换为本地模型目录。
+
+```bash
+swift sft \
+    --model /path/to/d3-flash \
+    --model_type d3 --task_type decision \
+    --external_plugins examples/train/decision/dataset.py \
+    --dataset d3_decision --val_dataset d3_decision_val --split_dataset_ratio 0 \
+    --tuner_type lora --tuner_backend peft \
+    --lora_rank 8 --lora_alpha 16 --lora_dropout 0 \
+    --loss_type scoring --padding_side left --attn_impl sdpa \
+    --torch_dtype bfloat16 --max_length 2048 \
+    --gradient_checkpointing true \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
+    --per_device_train_batch_size 1 --per_device_eval_batch_size 1 \
+    --learning_rate 1e-4 --gradient_accumulation_steps 1 --max_steps 4 \
+    --eval_strategy steps --eval_steps 2 --save_steps 2 --logging_steps 1 \
+    --output_dir output/d3
+```
+
+**关键参数**
+
+- 插件为训练集和验证集注册 `D3Preprocessor`。使用自有数据时，设置 `D3_TRAIN_FILE` 和 `D3_VAL_FILE` 指向对应的 JSONL 文件。
+- `--loss_type scoring` 在每道题的有效选项上计算交叉熵，监督目标取自 `target_probs`。
+- `--padding_side left` 使批内每道题的最后一个提示词 token 对齐到序列末尾，供读出头打分。`--attn_impl sdpa` 用于双向的 full-attention 层，Gated DeltaNet 层保持因果扫描。
+
+示例运行 4 个优化步，每 2 步评估并保存一次。也可设置 `D3_MODEL_DIR` 和 `D3_OUTPUT_DIR`，运行[训练脚本](../../../examples/train/decision/d3.sh)。
+
 ### StartLux
 
 StartLux-Decision v1.1 AutoThink 自带已合并的底座，因此在其上训练全新 LoRA，字母 read-out 联合训练：
@@ -647,7 +691,7 @@ swift infer \
 
 Decision 模型的数据集有两种来源：**本地数据集**（通过 `--external_plugins` 注册，使用对应的 `ScoringPreprocessor` 子类）和**远程数据集**（SWIFT 内置的 Open-Jev 语料，直接用 `--dataset <名称>` 加载）。
 
-> **重要**：Decision 数据**不能**通过 `--dataset /path/to/file.jsonl` 直接加载。swift 的标准数据加载方法（直接传文件路径，使用 `AutoPreprocessor`）不适用于 decision 数据——`AutoPreprocessor` 不认识 `{state, questions: [{kind, question, options, gold}]}` 这种 schema，会静默走错路径或报错。必须通过 `--external_plugins` 注册一个 Python 插件，用对应的 `ScoringPreprocessor` 子类处理数据。
+> 加载原始 Decision 记录（如 `state/questions/answers`）时，通过 `--external_plugins` 注册对应的 `ScoringPreprocessor` 子类，并通过注册名选择数据集。D3-Flash 的训练和验证示例分别使用 `d3_decision` 和 `d3_decision_val`。
 
 
 
@@ -656,7 +700,7 @@ Decision 模型的数据集有两种来源：**本地数据集**（通过 `--ext
 SWIFT 将 [Open-Jev](https://www.modelscope.cn/datasets/ZefanCai/Open-Jev) 和 [Open-Jev-v1.1](https://modelscope.cn/datasets/ZefanCai/Open-Jev-v1.1)语料注册为内置远程数据集。无需 `--external_plugins`，直接用 `--dataset <名称>` 即可。
 
 
-数据集名按 **`open_jev_<model_type>`** 规则命名——每个已接入模型（见[支持模型](#支持模型)表格）都按此约定注册了对应的远程数据集，预处理使用该模型专属的 `ScoringPreprocessor` 子类。使用 v1.1 语料时替换为带 `_v11` 后缀的名称（如 `--dataset open_jev_<model_type>_v11`）。
+数据集名按 **`open_jev_<model_type>`** 规则命名——支持该语料的模型按此约定注册对应的远程数据集，预处理使用该模型专属的 `ScoringPreprocessor` 子类。使用 v1.1 语料时替换为带 `_v11` 后缀的名称（如 `--dataset open_jev_<model_type>_v11`）。
 
 本文档训练命令中的 `--dataset` 使用远程数据集名称（如 `open_jev_jev`），需要在线下载 `ZefanCai/Open-Jev` 语料。
 
@@ -719,7 +763,7 @@ score（`options` 被强制设为标准 `["0", "1", "2", "3", "4", "5"]`）：
 sh examples/train/decision/<model_type>.sh
 ```
 
-脚本内部通过 `--external_plugins examples/train/decision/dataset.py --dataset <model_type>_decision` 加载本地数据，无需下载远程数据集。而本文档正文训练命令用的是远程数据集（如 `--dataset open_jev_jev`），两者仅数据来源不同，其余参数完全一致。
+D3-Flash 使用 `examples/train/decision/dataset.py` 注册训练集和验证集，从仓库根目录运行 `bash examples/train/decision/d3.sh`。
 
 #### 编写自定义插件
 
@@ -931,6 +975,7 @@ OmniJev adapter 还需通过环境变量指向四个头制品（位于 adapter �
 - **`h2o` 读头固定**：`label_rows` 以 buffer 保存，不参与训练；`serve_config.json`（255 个标签 + per-kind 温度）必须随 checkpoint 一起提供。
 - **`h2o` 双向注意力**：默认跟随 `serve_config.json` 的 `two_way.default`（bidirectional），可用 `H2O_TWO_WAY=0` 回退单向；双向需 `transformers>=5.13.0`，Ascend NPU 上 full-attention mask 展开为 `[B,1,S,S]`。
 - **`h2o` 暂不支持图像输入**：模板层已能透传图像，但数据集侧尚未从记录中抽取图片，当前仅支持文本 `state`；后续补充。
+- D3-Flash 每条序列处理一个文本问题，训练时关闭 packing 和 padding-free。提示词超过长度上限时会抛出 `MaxLengthError`。
 - `tie_word_embeddings=True` **adapter 合并**：仅影响合并/转格式，训练与推理不受影响。
 
 
